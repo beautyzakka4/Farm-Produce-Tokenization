@@ -212,3 +212,113 @@
     (ok true)
   )
 )
+
+
+
+(define-map produce-ratings
+  { token-id: uint }
+  {
+    total-rating: uint,
+    number-of-ratings: uint,
+    average-rating: uint
+  }
+)
+
+(define-map investor-ratings
+  { token-id: uint, investor: principal }
+  { has-rated: bool }
+)
+
+(define-read-only (get-produce-rating (token-id uint))
+  (default-to 
+    { total-rating: u0, number-of-ratings: u0, average-rating: u0 }
+    (map-get? produce-ratings { token-id: token-id })
+  )
+)
+
+(define-public (rate-produce (token-id uint) (rating uint))
+  (let
+    (
+      (current-rating (get-produce-rating token-id))
+      (investor-shares (get-investor-shares tx-sender token-id))
+      (has-rated (default-to { has-rated: false } (map-get? investor-ratings { token-id: token-id, investor: tx-sender })))
+    )
+    (asserts! (and (>= rating u1) (<= rating u5)) err-invalid-amount)
+    (asserts! (> investor-shares u0) err-unauthorized)
+    (asserts! (not (get has-rated has-rated)) err-already-exists)
+    
+    (map-set produce-ratings
+      { token-id: token-id }
+      {
+        total-rating: (+ (get total-rating current-rating) rating),
+        number-of-ratings: (+ (get number-of-ratings current-rating) u1),
+        average-rating: (/ (+ (get total-rating current-rating) rating) (+ (get number-of-ratings current-rating) u1))
+      }
+    )
+    
+    (map-set investor-ratings
+      { token-id: token-id, investor: tx-sender }
+      { has-rated: true }
+    )
+    
+    (ok true)
+  )
+)
+
+
+(define-map market-listings
+  { token-id: uint, seller: principal }
+  {
+    shares: uint,
+    price-per-share: uint,
+    active: bool
+  }
+)
+
+(define-read-only (get-listing (token-id uint) (seller principal))
+  (map-get? market-listings { token-id: token-id, seller: seller })
+)
+
+(define-public (create-listing (token-id uint) (shares uint) (price-per-share uint))
+  (let
+    (
+      (seller-shares (get-investor-shares tx-sender token-id))
+    )
+    (asserts! (>= seller-shares shares) err-insufficient-tokens)
+    (asserts! (> price-per-share u0) err-invalid-amount)
+    
+    (map-set market-listings
+      { token-id: token-id, seller: tx-sender }
+      {
+        shares: shares,
+        price-per-share: price-per-share,
+        active: true
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (purchase-listing (token-id uint) (seller principal) (shares uint))
+  (let
+    (
+      (listing (unwrap! (get-listing token-id seller) err-not-found))
+      (total-price (* shares (get price-per-share listing)))
+    )
+    (asserts! (get active listing) err-not-found)
+    (asserts! (>= (get shares listing) shares) err-insufficient-tokens)
+    
+    (try! (stx-transfer? total-price tx-sender seller))
+    ;; (try! (transfer-shares token-id seller tx-sender shares))
+    
+    (map-set market-listings
+      { token-id: token-id, seller: seller }
+      {
+        shares: (- (get shares listing) shares),
+        price-per-share: (get price-per-share listing),
+        active: (> (- (get shares listing) shares) u0)
+      }
+    )
+    (ok true)
+  )
+)
