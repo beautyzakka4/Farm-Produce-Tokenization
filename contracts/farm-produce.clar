@@ -1,4 +1,14 @@
 (define-constant contract-owner tx-sender)
+(define-constant err-insufficient-funds (err u200))
+(define-constant err-not-insured (err u201))
+(define-constant err-claim-period-expired (err u202))
+(define-constant err-already-claimed (err u203))
+(define-constant err-invalid-claim (err u204))
+(define-constant err-pool-not-found (err u205))
+
+(define-data-var total-pool-balance uint u0)
+(define-data-var next-policy-id uint u1)
+(define-data-var claim-period-blocks uint u1440)
 (define-constant err-owner-only (err u100))
 (define-constant err-not-found (err u101))
 (define-constant err-already-exists (err u102))
@@ -318,6 +328,226 @@
         price-per-share: (get price-per-share listing),
         active: (> (- (get shares listing) shares) u0)
       }
+    )
+    (ok true)
+  )
+)
+
+
+
+(define-map insurance-policies
+  { policy-id: uint }
+  {
+    investor: principal,
+    token-id: uint,
+    insured-amount: uint,
+    premium-paid: uint,
+    coverage-start: uint,
+    coverage-end: uint,
+    active: bool
+  }
+)
+
+(define-map investor-policies
+  { investor: principal, token-id: uint }
+  { policy-id: uint }
+)
+
+(define-map pool-contributions
+  { contributor: principal }
+  { total-contributed: uint, share-percentage: uint }
+)
+
+(define-map insurance-claims
+  { policy-id: uint }
+  {
+    claim-amount: uint,
+    claim-date: uint,
+    processed: bool,
+    approved: bool
+  }
+)
+
+(define-read-only (get-pool-balance)
+  (var-get total-pool-balance)
+)
+
+(define-read-only (get-policy (policy-id uint))
+  (map-get? insurance-policies { policy-id: policy-id })
+)
+
+(define-read-only (get-investor-policy (investor principal) (token-id uint))
+  (match (map-get? investor-policies { investor: investor, token-id: token-id })
+    policy-data (get-policy (get policy-id policy-data))
+    none
+  )
+)
+
+(define-read-only (get-contribution (contributor principal))
+  (default-to 
+    { total-contributed: u0, share-percentage: u0 }
+    (map-get? pool-contributions { contributor: contributor })
+  )
+)
+
+(define-read-only (calculate-premium (insured-amount uint))
+  (/ (* insured-amount u5) u100)
+)
+
+(define-public (contribute-to-pool (amount uint))
+  (let
+    (
+      (current-balance (var-get total-pool-balance))
+      (contributor-data (get-contribution tx-sender))
+      (new-total (+ current-balance amount))
+      (new-contribution (+ (get total-contributed contributor-data) amount))
+      (new-share (/ (* new-contribution u10000) new-total))
+    )
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    
+    (var-set total-pool-balance new-total)
+    (map-set pool-contributions
+      { contributor: tx-sender }
+      {
+        total-contributed: new-contribution,
+        share-percentage: new-share
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (purchase-insurance (token-id uint) (insured-amount uint))
+  (let
+    (
+      (policy-id (var-get next-policy-id))
+      (premium (calculate-premium insured-amount))
+      (current-block (unwrap-panic (get-stacks-block-info? time u0)))
+      (coverage-end (+ current-block (* (var-get claim-period-blocks) u10)))
+    )
+    (asserts! (> insured-amount u0) err-invalid-claim)
+    (asserts! (is-none (map-get? investor-policies { investor: tx-sender, token-id: token-id })) err-already-claimed)
+    
+    (try! (stx-transfer? premium tx-sender (as-contract tx-sender)))
+    (var-set total-pool-balance (+ (var-get total-pool-balance) premium))
+    
+    (map-set insurance-policies
+      { policy-id: policy-id }
+      {
+        investor: tx-sender,
+        token-id: token-id,
+        insured-amount: insured-amount,
+        premium-paid: premium,
+        coverage-start: current-block,
+        coverage-end: coverage-end,
+        active: true
+      }
+    )
+    
+    (map-set investor-policies
+      { investor: tx-sender, token-id: token-id }
+      { policy-id: policy-id }
+    )
+    
+    (var-set next-policy-id (+ policy-id u1))
+    (ok policy-id)
+  )
+)
+
+(define-public (file-insurance-claim (policy-id uint))
+  (let
+    (
+      (policy (unwrap! (get-policy policy-id) err-not-insured))
+      (current-block (unwrap-panic (get-stacks-block-info? time u0)))
+    )
+    (asserts! (is-eq (get investor policy) tx-sender) err-not-insured)
+    (asserts! (get active policy) err-not-insured)
+    (asserts! (<= current-block (get coverage-end policy)) err-claim-period-expired)
+    (asserts! (is-none (map-get? insurance-claims { policy-id: policy-id })) err-already-claimed)
+    
+    (map-set insurance-claims
+      { policy-id: policy-id }
+      {
+        claim-amount: (get insured-amount policy),
+        claim-date: current-block,
+        processed: false,
+        approved: false
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (process-claim (policy-id uint) (approved bool))
+  (let
+    (
+      (policy (unwrap! (get-policy policy-id) err-not-insured))
+      (claim (unwrap! (map-get? insurance-claims { policy-id: policy-id }) err-invalid-claim))
+      (claim-amount (get claim-amount claim))
+      (current-balance (var-get total-pool-balance))
+    )
+    (asserts! (not (get processed claim)) err-already-claimed)
+    (asserts! (>= current-balance claim-amount) err-insufficient-funds)
+    
+    (if approved
+      (begin
+        (try! (as-contract (stx-transfer? claim-amount tx-sender (get investor policy))))
+        (var-set total-pool-balance (- current-balance claim-amount))
+        (map-set insurance-policies
+          { policy-id: policy-id }
+          (merge policy { active: false })
+        )
+      )
+      true
+    )
+    
+    (map-set insurance-claims
+      { policy-id: policy-id }
+      (merge claim { processed: true, approved: approved })
+    )
+    (ok approved)
+  )
+)
+
+(define-public (withdraw-contribution (amount uint))
+  (let
+    (
+      (contributor-data (get-contribution tx-sender))
+      (current-balance (var-get total-pool-balance))
+      (max-withdrawal (/ (* (get share-percentage contributor-data) current-balance) u10000))
+    )
+    (asserts! (>= max-withdrawal amount) err-insufficient-funds)
+    (asserts! (>= current-balance amount) err-insufficient-funds)
+    
+    (try! (as-contract (stx-transfer? amount tx-sender tx-sender)))
+    (var-set total-pool-balance (- current-balance amount))
+    
+    (map-set pool-contributions
+      { contributor: tx-sender }
+      {
+        total-contributed: (- (get total-contributed contributor-data) amount),
+        share-percentage: (/ (* (- (get total-contributed contributor-data) amount) u10000) (- current-balance amount))
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-read-only (get-claim-status (policy-id uint))
+  (map-get? insurance-claims { policy-id: policy-id })
+)
+
+(define-public (cancel-policy (policy-id uint))
+  (let
+    (
+      (policy (unwrap! (get-policy policy-id) err-not-insured))
+    )
+    (asserts! (is-eq (get investor policy) tx-sender) err-not-insured)
+    (asserts! (get active policy) err-not-insured)
+    
+    (map-set insurance-policies
+      { policy-id: policy-id }
+      (merge policy { active: false })
     )
     (ok true)
   )
