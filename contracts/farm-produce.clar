@@ -552,3 +552,108 @@
     (ok true)
   )
 )
+
+(define-map yield-predictions
+  { token-id: uint }
+  {
+    predicted-yield: uint,
+    actual-yield: uint,
+    prediction-date: uint,
+    harvest-date: uint,
+    accuracy-percentage: uint,
+    reported: bool
+  }
+)
+
+(define-map farmer-performance
+  { farmer: principal }
+  {
+    total-predictions: uint,
+    accurate-predictions: uint,
+    overall-accuracy: uint,
+    reputation-score: uint
+  }
+)
+
+(define-read-only (get-yield-prediction (token-id uint))
+  (map-get? yield-predictions { token-id: token-id })
+)
+
+(define-read-only (get-farmer-performance (farmer principal))
+  (default-to 
+    { total-predictions: u0, accurate-predictions: u0, overall-accuracy: u0, reputation-score: u0 }
+    (map-get? farmer-performance { farmer: farmer })
+  )
+)
+
+(define-public (submit-yield-prediction (token-id uint) (predicted-yield uint))
+  (let
+    (
+      (produce (unwrap! (map-get? produce-details { token-id: token-id }) err-not-found))
+      (farmer (get farmer produce))
+      (current-time (unwrap-panic (get-stacks-block-info? time u0)))
+    )
+    (asserts! (is-eq tx-sender farmer) err-unauthorized)
+    (asserts! (> predicted-yield u0) err-invalid-amount)
+    (asserts! (is-none (map-get? yield-predictions { token-id: token-id })) err-already-exists)
+    
+    (map-set yield-predictions
+      { token-id: token-id }
+      {
+        predicted-yield: predicted-yield,
+        actual-yield: u0,
+        prediction-date: current-time,
+        harvest-date: u0,
+        accuracy-percentage: u0,
+        reported: false
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (report-actual-yield (token-id uint) (actual-yield uint))
+  (let
+    (
+      (produce (unwrap! (map-get? produce-details { token-id: token-id }) err-not-found))
+      (farmer (get farmer produce))
+      (prediction (unwrap! (map-get? yield-predictions { token-id: token-id }) err-not-found))
+      (predicted-yield (get predicted-yield prediction))
+      (current-time (unwrap-panic (get-stacks-block-info? time u0)))
+      (accuracy (if (> predicted-yield actual-yield)
+                   (/ (* actual-yield u100) predicted-yield)
+                   (/ (* predicted-yield u100) actual-yield)))
+      (performance (get-farmer-performance farmer))
+      (new-total-predictions (+ (get total-predictions performance) u1))
+      (new-accurate-predictions (if (>= accuracy u80) 
+                                   (+ (get accurate-predictions performance) u1)
+                                   (get accurate-predictions performance)))
+      (new-overall-accuracy (/ (* new-accurate-predictions u100) new-total-predictions))
+      (new-reputation-score (/ (+ new-overall-accuracy u50) u2))
+    )
+    (asserts! (is-eq tx-sender farmer) err-unauthorized)
+    (asserts! (> actual-yield u0) err-invalid-amount)
+    (asserts! (not (get reported prediction)) err-already-claimed)
+    
+    (map-set yield-predictions
+      { token-id: token-id }
+      (merge prediction {
+        actual-yield: actual-yield,
+        harvest-date: current-time,
+        accuracy-percentage: accuracy,
+        reported: true
+      })
+    )
+    
+    (map-set farmer-performance
+      { farmer: farmer }
+      {
+        total-predictions: new-total-predictions,
+        accurate-predictions: new-accurate-predictions,
+        overall-accuracy: new-overall-accuracy,
+        reputation-score: new-reputation-score
+      }
+    )
+    (ok accuracy)
+  )
+)
