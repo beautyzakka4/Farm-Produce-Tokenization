@@ -657,3 +657,277 @@
     (ok accuracy)
   )
 )
+
+;; Supply Chain Verification and Traceability System
+(define-constant err-invalid-stage (err u300))
+(define-constant err-already-verified (err u301))
+(define-constant err-unauthorized-verifier (err u302))
+(define-constant err-invalid-quality-score (err u303))
+(define-constant err-stage-sequence-error (err u304))
+
+;; Supply chain stage constants
+(define-constant stage-harvest u1)
+(define-constant stage-processing u2)
+(define-constant stage-packaging u3)
+(define-constant stage-distribution u4)
+(define-constant stage-retail u5)
+(define-constant stage-consumer u6)
+
+(define-data-var next-checkpoint-id uint u1)
+
+;; Authorized verifiers for each stage
+(define-map stage-verifiers
+  { stage: uint, verifier: principal }
+  { authorized: bool, certification-level: uint }
+)
+
+;; Supply chain checkpoints for each token
+(define-map supply-chain-checkpoints
+  { token-id: uint, checkpoint-id: uint }
+  {
+    stage: uint,
+    verifier: principal,
+    timestamp: uint,
+    location: (string-ascii 50),
+    quality-score: uint,
+    temperature: uint,
+    humidity: uint,
+    notes: (string-ascii 100),
+    verified: bool
+  }
+)
+
+;; Track current stage for each token
+(define-map token-current-stage
+  { token-id: uint }
+  { current-stage: uint, last-checkpoint: uint }
+)
+
+;; Quality attestations from certified inspectors
+(define-map quality-attestations
+  { token-id: uint, stage: uint }
+  {
+    inspector: principal,
+    quality-grade: (string-ascii 10),
+    safety-certified: bool,
+    organic-certified: bool,
+    inspection-date: uint,
+    certificate-hash: (string-ascii 64)
+  }
+)
+
+;; Transportation records between stages
+(define-map transportation-records
+  { token-id: uint, from-stage: uint, to-stage: uint }
+  {
+    carrier: principal,
+    vehicle-id: (string-ascii 20),
+    departure-time: uint,
+    arrival-time: uint,
+    route: (string-ascii 100),
+    temperature-maintained: bool
+  }
+)
+
+;; Consumer delivery confirmations
+(define-map consumer-deliveries
+  { token-id: uint }
+  {
+    consumer: principal,
+    delivery-date: uint,
+    delivery-location: (string-ascii 50),
+    satisfaction-rating: uint,
+    confirmed: bool
+  }
+)
+
+;; Read-only functions for traceability queries
+(define-read-only (get-checkpoint (token-id uint) (checkpoint-id uint))
+  (map-get? supply-chain-checkpoints { token-id: token-id, checkpoint-id: checkpoint-id })
+)
+
+(define-read-only (get-token-stage (token-id uint))
+  (default-to 
+    { current-stage: u0, last-checkpoint: u0 }
+    (map-get? token-current-stage { token-id: token-id })
+  )
+)
+
+(define-read-only (get-quality-attestation (token-id uint) (stage uint))
+  (map-get? quality-attestations { token-id: token-id, stage: stage })
+)
+
+(define-read-only (get-transportation-record (token-id uint) (from-stage uint) (to-stage uint))
+  (map-get? transportation-records { token-id: token-id, from-stage: from-stage, to-stage: to-stage })
+)
+
+(define-read-only (get-consumer-delivery (token-id uint))
+  (map-get? consumer-deliveries { token-id: token-id })
+)
+
+(define-read-only (is-stage-verifier (stage uint) (verifier principal))
+  (default-to 
+    { authorized: false, certification-level: u0 }
+    (map-get? stage-verifiers { stage: stage, verifier: verifier })
+  )
+)
+
+;; Authorize verifiers for specific stages
+(define-public (authorize-stage-verifier (stage uint) (verifier principal) (certification-level uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (and (>= stage stage-harvest) (<= stage stage-consumer)) err-invalid-stage)
+    (asserts! (and (>= certification-level u1) (<= certification-level u5)) err-invalid-amount)
+    
+    (map-set stage-verifiers
+      { stage: stage, verifier: verifier }
+      { authorized: true, certification-level: certification-level }
+    )
+    (ok true)
+  )
+)
+
+;; Create supply chain checkpoint
+(define-public (create-checkpoint (token-id uint) (stage uint) (location (string-ascii 50)) (quality-score uint) (temperature uint) (humidity uint) (notes (string-ascii 100)))
+  (let
+    (
+      (checkpoint-id (var-get next-checkpoint-id))
+      (current-stage-info (get-token-stage token-id))
+      (current-stage (get current-stage current-stage-info))
+      (verifier-info (is-stage-verifier stage tx-sender))
+      (current-time (unwrap-panic (get-stacks-block-info? time u0)))
+    )
+    (asserts! (get authorized verifier-info) err-unauthorized-verifier)
+    (asserts! (and (>= stage stage-harvest) (<= stage stage-consumer)) err-invalid-stage)
+    (asserts! (and (>= quality-score u1) (<= quality-score u100)) err-invalid-quality-score)
+    (asserts! (or (is-eq current-stage u0) (is-eq stage (+ current-stage u1))) err-stage-sequence-error)
+    
+    (map-set supply-chain-checkpoints
+      { token-id: token-id, checkpoint-id: checkpoint-id }
+      {
+        stage: stage,
+        verifier: tx-sender,
+        timestamp: current-time,
+        location: location,
+        quality-score: quality-score,
+        temperature: temperature,
+        humidity: humidity,
+        notes: notes,
+        verified: true
+      }
+    )
+    
+    (map-set token-current-stage
+      { token-id: token-id }
+      { current-stage: stage, last-checkpoint: checkpoint-id }
+    )
+    
+    (var-set next-checkpoint-id (+ checkpoint-id u1))
+    (ok checkpoint-id)
+  )
+)
+
+;; Record quality attestation from certified inspector
+(define-public (record-quality-attestation (token-id uint) (stage uint) (quality-grade (string-ascii 10)) (safety-certified bool) (organic-certified bool) (certificate-hash (string-ascii 64)))
+  (let
+    (
+      (verifier-info (is-stage-verifier stage tx-sender))
+      (current-time (unwrap-panic (get-stacks-block-info? time u0)))
+    )
+    (asserts! (get authorized verifier-info) err-unauthorized-verifier)
+    (asserts! (>= (get certification-level verifier-info) u3) err-unauthorized-verifier)
+    (asserts! (is-none (map-get? quality-attestations { token-id: token-id, stage: stage })) err-already-verified)
+    
+    (map-set quality-attestations
+      { token-id: token-id, stage: stage }
+      {
+        inspector: tx-sender,
+        quality-grade: quality-grade,
+        safety-certified: safety-certified,
+        organic-certified: organic-certified,
+        inspection-date: current-time,
+        certificate-hash: certificate-hash
+      }
+    )
+    (ok true)
+  )
+)
+
+;; Record transportation between stages
+(define-public (record-transportation (token-id uint) (from-stage uint) (to-stage uint) (vehicle-id (string-ascii 20)) (route (string-ascii 100)) (temperature-maintained bool))
+  (let
+    (
+      (verifier-info (is-stage-verifier to-stage tx-sender))
+      (current-time (unwrap-panic (get-stacks-block-info? time u0)))
+    )
+    (asserts! (get authorized verifier-info) err-unauthorized-verifier)
+    (asserts! (is-eq to-stage (+ from-stage u1)) err-stage-sequence-error)
+    (asserts! (is-none (map-get? transportation-records { token-id: token-id, from-stage: from-stage, to-stage: to-stage })) err-already-verified)
+    
+    (map-set transportation-records
+      { token-id: token-id, from-stage: from-stage, to-stage: to-stage }
+      {
+        carrier: tx-sender,
+        vehicle-id: vehicle-id,
+        departure-time: u0,
+        arrival-time: current-time,
+        route: route,
+        temperature-maintained: temperature-maintained
+      }
+    )
+    (ok true)
+  )
+)
+
+;; Confirm consumer delivery
+(define-public (confirm-consumer-delivery (token-id uint) (delivery-location (string-ascii 50)) (satisfaction-rating uint))
+  (let
+    (
+      (current-stage-info (get-token-stage token-id))
+      (current-stage (get current-stage current-stage-info))
+      (current-time (unwrap-panic (get-stacks-block-info? time u0)))
+    )
+    (asserts! (is-eq current-stage stage-retail) err-stage-sequence-error)
+    (asserts! (and (>= satisfaction-rating u1) (<= satisfaction-rating u5)) err-invalid-amount)
+    (asserts! (is-none (map-get? consumer-deliveries { token-id: token-id })) err-already-verified)
+    
+    (map-set consumer-deliveries
+      { token-id: token-id }
+      {
+        consumer: tx-sender,
+        delivery-date: current-time,
+        delivery-location: delivery-location,
+        satisfaction-rating: satisfaction-rating,
+        confirmed: true
+      }
+    )
+    
+    (map-set token-current-stage
+      { token-id: token-id }
+      { current-stage: stage-consumer, last-checkpoint: (get last-checkpoint current-stage-info) }
+    )
+    (ok true)
+  )
+)
+
+;; Get complete traceability trail for a token
+(define-read-only (get-traceability-summary (token-id uint))
+  (let
+    (
+      (stage-info (get-token-stage token-id))
+      (produce-info (get-produce-details token-id))
+    )
+    {
+      token-id: token-id,
+      current-stage: (get current-stage stage-info),
+      last-checkpoint: (get last-checkpoint stage-info),
+      farmer: (default-to 'SP000000000000000000002Q6VF78 (get farmer produce-info)),
+      produce-type: (default-to "" (get produce-type produce-info)),
+      location: (default-to "" (get location produce-info))
+    }
+  )
+)
+
+
+
+
